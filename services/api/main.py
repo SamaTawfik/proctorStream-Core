@@ -1,63 +1,83 @@
 import os
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
+from typing import List
+from fastapi import FastAPI, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, EmailStr
 
-app = FastAPI(
-    title="ProctorStream Ingestion API",
-    version="1.0.0",
-    description="API Gateway for receiving student media streams and monitoring events."
-)
+from services.api.database import get_db
+import services.api.models as models
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="ProctorStream API", version="1.0.0")
 
-# Temporary directory to store received chunks before pipeline processing
-UPLOAD_DIR = "temp_uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# --- Schemas (Pydantic models للتحقق من البيانات) ---
 
+class UserCreate(BaseModel):
+    email: str
+    full_name: str
+    role: str = "student"
 
-@app.get("/health", status_code=status.HTTP_200_OK)
-async def health_check():
-    return {
-        "status": "healthy",
-        "service": "proctorstream-api",
-        "version": "1.0.0"
-    }
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    full_name: str
+    role: str
 
+    class Config:
+        from_attributes = True
 
-@app.post("/api/v1/stream/upload", status_code=status.HTTP_201_CREATED)
-async def upload_video_chunk(
-    session_id: str = Form(...),
-    chunk_index: int = Form(...),
-    file: UploadFile = File(...)
-):
-    """
-    Receives short video chunks (e.g. 5-second WebM files) from the proctoring frontend.
-    """
-    try:
-        # Generate clean local filename
-        filename = f"{session_id}_chunk_{chunk_index}_{file.filename}"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+class ExamSessionCreate(BaseModel):
+    student_id: int
+    title: str
 
-        # Save chunk to disk
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+class ExamSessionResponse(BaseModel):
+    id: int
+    student_id: int
+    title: str
+    status: str
 
-        return {
-            "status": "success",
-            "message": "Chunk uploaded successfully",
-            "session_id": session_id,
-            "chunk_index": chunk_index,
-            "bytes_received": len(content)
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process video chunk: {str(e)}"
-        )
+    class Config:
+        from_attributes = True
+
+# --- Endpoints ---
+
+@app.get("/")
+def root():
+    return {"message": "ProctorStream API is running"}
+
+# 1. إنشاء مستخدم جديد
+@app.post("/users/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    new_user = models.User(
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+# 2. جلب جميع المستخدمين
+@app.get("/users/", response_model=List[UserResponse])
+def read_users(db: Session = Depends(get_db)):
+    return db.query(models.User).all()
+
+# 3. إنشاء جلسة امتحان
+@app.post("/sessions/", response_model=ExamSessionResponse, status_code=status.HTTP_201_CREATED)
+def create_session(session: ExamSessionCreate, db: Session = Depends(get_db)):
+    student = db.query(models.User).filter(models.User.id == session.student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    
+    new_session = models.ExamSession(
+        student_id=session.student_id,
+        title=session.title
+    )
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
+    return new_session
